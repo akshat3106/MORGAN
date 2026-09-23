@@ -1,23 +1,16 @@
 """Network observation.
 
-Currently one tool. ``get_network_status`` is the first thing MORGAN looks at when
-it is handed "the internet is broken", and its job is to turn that into one of a
-few very different machine states: no adapter is up, an adapter is up but has no
-routable address, or everything is connected and the fault is further out.
+Step 1.5 tools:
+- ``get_network_status``: Inspect interfaces, link state, addresses, and error counters.
+- ``test_connectivity``: Check reachability, packet loss, and latency via ping.
 
-Those need to be told apart *before* anything is proposed, because the fixes do not
-overlap -- a DHCP failure and a DNS failure both present as "no internet" and
-share no remedy. The distinguishing facts are reported as fields rather than left
-for a model to infer from a wall of adapter output: ``no_active_connection`` and
-``self_assigned_ip`` are each a specific claim about the machine.
-
-The remaining Step 1.5 tools (``test_connectivity``, ``test_dns``,
-``flush_dns_cache``, ``reset_network_stack``) are not written yet; they all shell
-out, and will share a ``_run`` helper built on ``create_subprocess_exec`` with fixed
+The remaining Step 1.5 tools (``test_dns``, ``flush_dns_cache``, ``reset_network_stack``)
+will use the shared ``_run`` helper built on ``create_subprocess_exec`` with fixed
 argument lists.
 """
 
 import asyncio
+import re
 import socket
 
 import psutil
@@ -32,6 +25,47 @@ _MB = 1024 ** 2
 _APIPA_PREFIX = "169.254."
 
 _LOOPBACK_PREFIX = "127."
+
+_PACKETS_RE = re.compile(
+    r"Packets:\s+Sent\s*=\s*(\d+),\s*Received\s*=\s*(\d+),\s*Lost\s*=\s*(\d+)\s*\(([\d.]+)%\s*loss\)",
+    re.IGNORECASE,
+)
+_RTT_RE = re.compile(
+    r"Minimum\s*=\s*(\d+)ms,\s*Maximum\s*=\s*(\d+)ms,\s*Average\s*=\s*(\d+)ms",
+    re.IGNORECASE,
+)
+
+
+async def _run(
+    *args: str, timeout_seconds: int = 30
+) -> tuple[int, str, str]:
+    """Execute a subprocess safely with fixed argument list.
+
+    Returns (returncode, stdout, stderr).
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        return -1, "", f"Executable not found: {exc}"
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout_seconds
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return -1, "", f"Command timed out after {timeout_seconds}s"
+
+    return (
+        proc.returncode if proc.returncode is not None else 0,
+        stdout.decode("utf-8", errors="replace").strip(),
+        stderr.decode("utf-8", errors="replace").strip(),
+    )
 
 
 def _classify(name: str, addresses: list[dict]) -> tuple[bool, bool]:
@@ -182,8 +216,96 @@ async def get_network_status() -> dict:
     }
 
 
+async def test_connectivity(host: str = "8.8.8.8", count: int = 4) -> dict:
+    """Check network reachability and packet loss to a host or IP via ping.
+
+    Read-only tool: measures packet loss and round-trip latency.
+    """
+    host = (host or "").strip()
+    if not host or any(c in host for c in " \t\n\r;|&`$><\"'"):
+        return {
+            "ok": False,
+            "error": "bad_host",
+            "message": f"Invalid host name or IP address: {host!r}.",
+        }
+
+    try:
+        count = max(1, min(int(count), 20))
+    except (TypeError, ValueError):
+        return {
+            "ok": False,
+            "error": "bad_count",
+            "message": f"count must be an integer, got {count!r}.",
+        }
+
+    timeout_seconds = max(5, count * 3 + 2)
+    code, stdout, stderr = await _run(
+        "ping.exe", "-n", str(count), "-w", "2000", host,
+        timeout_seconds=timeout_seconds,
+    )
+
+    if code != 0 and not stdout:
+        return {
+            "ok": False,
+            "error": "ping_failed",
+            "host": host,
+            "message": f"Ping execution failed: {stderr or 'Unknown error'}",
+        }
+
+    pkt_match = _PACKETS_RE.search(stdout)
+    rtt_match = _RTT_RE.search(stdout)
+
+    if not pkt_match:
+        return {
+            "ok": True,
+            "host": host,
+            "reachable": False,
+            "packet_loss_percent": 100.0,
+            "packets_sent": count,
+            "packets_received": 0,
+            "avg_latency_ms": None,
+            "message": f"Host {host} is unreachable or could not be resolved.",
+        }
+
+    sent = int(pkt_match.group(1))
+    received = int(pkt_match.group(2))
+    lost = int(pkt_match.group(3))
+    loss_pct = float(pkt_match.group(4))
+
+    min_ms = int(rtt_match.group(1)) if rtt_match else None
+    max_ms = int(rtt_match.group(2)) if rtt_match else None
+    avg_ms = int(rtt_match.group(3)) if rtt_match else None
+
+    reachable = received > 0
+
+    if reachable:
+        if loss_pct > 0:
+            msg = f"{host} is reachable with {loss_pct:.0f}% packet loss (avg {avg_ms} ms)."
+        else:
+            msg = f"{host} is reachable with 0% packet loss (avg {avg_ms} ms)."
+    else:
+        msg = f"{host} is completely unreachable (100% packet loss)."
+
+    return {
+        "ok": True,
+        "host": host,
+        "reachable": reachable,
+        "packet_loss_percent": loss_pct,
+        "packets_sent": sent,
+        "packets_received": received,
+        "packets_lost": lost,
+        "min_latency_ms": min_ms,
+        "max_latency_ms": max_ms,
+        "avg_latency_ms": avg_ms,
+        "message": msg,
+    }
+
+
 def register(mcp) -> None:
     """Expose this module's tools on the MCP server and declare their risk."""
     mcp.tool()(get_network_status)
+    mcp.tool()(test_connectivity)
 
     register_risk("get_network_status", RiskLevel.READ_ONLY)
+    register_risk("test_connectivity", RiskLevel.READ_ONLY)
+
