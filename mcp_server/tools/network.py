@@ -1,17 +1,17 @@
-"""Network observation.
+"""Network observation and remediation.
 
 Step 1.5 tools:
-- ``get_network_status``: Inspect interfaces, link state, addresses, and error counters.
-- ``test_connectivity``: Check reachability, packet loss, and latency via ping.
-
-The remaining Step 1.5 tools (``test_dns``, ``flush_dns_cache``, ``reset_network_stack``)
-will use the shared ``_run`` helper built on ``create_subprocess_exec`` with fixed
-argument lists.
+- ``get_network_status``: Inspect interfaces, link state, addresses, and error counters (read_only).
+- ``test_connectivity``: Check reachability, packet loss, and latency via ping (read_only).
+- ``test_dns``: Query DNS resolution time and resolved IP addresses (read_only).
+- ``flush_dns_cache``: Purge the Windows DNS resolver cache (low risk).
+- ``reset_network_stack``: Reset Winsock catalog and TCP/IP stack (high risk).
 """
 
 import asyncio
 import re
 import socket
+import time
 
 import psutil
 
@@ -301,11 +301,153 @@ async def test_connectivity(host: str = "8.8.8.8", count: int = 4) -> dict:
     }
 
 
+def _resolve_dns(hostname: str) -> list[str]:
+    """Synchronous getaddrinfo resolution helper returning unique IPs."""
+    info = socket.getaddrinfo(hostname, None)
+    addresses: list[str] = []
+    seen: set[str] = set()
+    for item in info:
+        ip = item[4][0]
+        if ip not in seen:
+            seen.add(ip)
+            addresses.append(ip)
+    return addresses
+
+
+async def test_dns(hostname: str = "google.com") -> dict:
+    """Test DNS resolution success and latency for a given hostname.
+
+    Read-only tool: measures name resolution time in milliseconds. Flags
+    resolution as slow if it takes more than 500 ms.
+    """
+    host = (hostname or "").strip()
+    if not host or any(c in host for c in " \t\n\r;|&`$><\"'"):
+        return {
+            "ok": False,
+            "error": "bad_hostname",
+            "message": f"Invalid host name: {hostname!r}.",
+        }
+
+    t0 = time.perf_counter()
+    try:
+        addresses = await asyncio.to_thread(_resolve_dns, host)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    except socket.gaierror as exc:
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        return {
+            "ok": True,
+            "hostname": host,
+            "resolved": False,
+            "addresses": [],
+            "latency_ms": round(elapsed_ms, 1),
+            "slow": False,
+            "message": f"Could not resolve hostname {host!r}: {exc}",
+        }
+    except OSError as exc:
+        return {
+            "ok": False,
+            "error": "dns_lookup_failed",
+            "hostname": host,
+            "message": f"DNS resolution failed for {host!r}: {exc}",
+        }
+
+    slow = elapsed_ms > 500.0
+    msg = f"Resolved {host} to {', '.join(addresses[:4])} in {elapsed_ms:.1f} ms."
+    if slow:
+        msg += " (Slow DNS resolution: >500 ms)."
+
+    return {
+        "ok": True,
+        "hostname": host,
+        "resolved": True,
+        "addresses": addresses,
+        "latency_ms": round(elapsed_ms, 1),
+        "slow": slow,
+        "message": msg,
+    }
+
+
+async def flush_dns_cache(dry_run: bool = True) -> dict:
+    """Flush the Windows DNS resolver cache.
+
+    Low-risk mutating action. Purges stale or poisoned DNS records by executing
+    ``ipconfig /flushdns``. When dry_run is True, returns a preview without modifying
+    the system.
+    """
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "message": "Would flush the Windows DNS resolver cache (ipconfig /flushdns).",
+        }
+
+    code, stdout, stderr = await _run("ipconfig.exe", "/flushdns", timeout_seconds=15)
+    if code != 0:
+        return {
+            "ok": False,
+            "dry_run": False,
+            "error": "flush_failed",
+            "message": f"Failed to flush DNS cache: {stderr or stdout or 'Unknown error'}",
+        }
+
+    return {
+        "ok": True,
+        "dry_run": False,
+        "message": "Successfully flushed the Windows DNS resolver cache.",
+    }
+
+
+async def reset_network_stack(dry_run: bool = True) -> dict:
+    """Reset the Winsock catalog and TCP/IP stack to default state.
+
+    HIGH-risk mutating action: executes ``netsh winsock reset`` and ``netsh int ip reset``.
+    Requires administrator privileges and a system reboot to take full effect.
+    When dry_run is True, returns a preview warning.
+    """
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "needs_admin": True,
+            "needs_reboot": True,
+            "message": (
+                "Would reset Winsock catalog ('netsh winsock reset') and TCP/IP stack "
+                "('netsh int ip reset'). Requires administrator privileges and a reboot."
+            ),
+        }
+
+    code_ws, out_ws, err_ws = await _run("netsh.exe", "winsock", "reset", timeout_seconds=15)
+    code_ip, out_ip, err_ip = await _run("netsh.exe", "int", "ip", "reset", timeout_seconds=15)
+
+    if code_ws != 0 or code_ip != 0:
+        err = err_ws or err_ip or out_ws or out_ip
+        return {
+            "ok": False,
+            "dry_run": False,
+            "error": "reset_failed",
+            "message": f"Network stack reset failed (elevation may be required): {err}",
+        }
+
+    return {
+        "ok": True,
+        "dry_run": False,
+        "needs_reboot": True,
+        "message": "Successfully reset Winsock and TCP/IP stack. A system reboot is required.",
+    }
+
+
 def register(mcp) -> None:
     """Expose this module's tools on the MCP server and declare their risk."""
     mcp.tool()(get_network_status)
     mcp.tool()(test_connectivity)
+    mcp.tool()(test_dns)
+    mcp.tool()(flush_dns_cache)
+    mcp.tool()(reset_network_stack)
 
     register_risk("get_network_status", RiskLevel.READ_ONLY)
     register_risk("test_connectivity", RiskLevel.READ_ONLY)
+    register_risk("test_dns", RiskLevel.READ_ONLY)
+    register_risk("flush_dns_cache", RiskLevel.LOW)
+    register_risk("reset_network_stack", RiskLevel.HIGH)
+
 
